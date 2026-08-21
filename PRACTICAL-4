@@ -1,0 +1,49 @@
+import sympy as sp
+
+
+x, y, λ = sp.symbols('x y λ')  
+
+# Step 2: Define objective function and constraint
+f = x**2 + y**2
+g = x + y - 4
+
+print("=== Lagrange Multipliers Method ===\n")
+print("Step 1: Objective Function -> f(x,y) =", f)
+print("Step 2: Constraint -> g(x,y) =", g)
+
+# Step 3: Define Lagrangian
+L = f + λ*g
+print("\nStep 3: Lagrangian -> L(x,y,λ) =", L)
+
+# Step 4: Compute partial derivatives
+dL_dx = sp.diff(L, x)
+dL_dy = sp.diff(L, y)
+dL_dλ = sp.diff(L, λ)
+
+print("\nStep 4: Partial Derivatives:")
+print("∂L/∂x =", dL_dx)
+print("∂L/∂y =", dL_dy)
+print("∂L/∂λ =", dL_dλ)
+
+# Step 5: Solve system of equations
+solutions = sp.solve([dL_dx, dL_dy, dL_dλ], (x, y, λ), dict=True)
+
+print("\nStep 5: Solving system of equations:")
+print("Solutions =", solutions)
+
+# Step 6: Evaluate objective function at solution
+results = []
+for sol in solutions:
+    x_val = sol[x]
+    y_val = sol[y]
+    λ_val = sol[λ]
+    f_val = f.subs({x: x_val, y: y_val})
+    results.append({"x": x_val, "y": y_val, "λ": λ_val, "f(x,y)": f_val})
+
+print("\nStep 6: Evaluating at solution:")
+for r in results:
+    print("At x =", r["x"], ", y =", r["y"], ", λ =", r["λ"], " -> f(x,y) =", r["f(x,y)"])
+
+print("\n=== Final Result ===")
+for r in results:
+    print("Optimal Solution: (x,y) =", (r["x"], r["y"]), "with f(x,y) =", r["f(x,y)"])
