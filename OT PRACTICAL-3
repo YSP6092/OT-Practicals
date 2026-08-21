@@ -1,0 +1,42 @@
+import sympy as sp
+x, y = sp.symbols('x y')
+f = x**2 + y**2
+g = x + y - 4
+
+print("=== Direct Substitution Method ===\n")
+print("Step 1: Objective Function -> f(x,y) =", f)
+print("Step 2: Constraint -> g(x,y) =", g)
+
+
+y_sub = sp.solve(g, y)[0]
+print("\nStep 3: Solving constraint for y -> y =", y_sub)
+
+f_sub = f.subs(y, y_sub)
+print("\nStep 4: Substituting y into f(x,y):")
+print("Reduced Function f(x) =", f_sub)
+
+f_prime = sp.diff(f_sub, x)
+print("\nStep 5: Differentiating reduced function:")
+print("f'(x) =", f_prime)
+
+
+critical_points = sp.solve(f_prime, x)
+print("\nStep 6: Solving f'(x)=0 for critical points:")
+print("Critical Points (x values) =", critical_points)
+
+
+results = []
+for cp in critical_points:
+    y_val = y_sub.subs(x, cp)
+    f_val = f.subs({x: cp, y: y_val})
+    results.append({"x": cp, "y": y_val, "f(x,y)": f_val})
+
+
+print("\nStep 7: Evaluating at critical points:")
+for r in results:
+    print("At x =", r["x"], ", y =", r["y"], " -> f(x,y) =", r["f(x,y)"])
+
+print("\n=== Final Result ===")
+for r in results:
+    print("Optimal Solution: (x,y) =", (r["x"], r["y"]), "with f(x,y) =", r["f(x,y)"])
+
