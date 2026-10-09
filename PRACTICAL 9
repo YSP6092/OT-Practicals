@@ -1,0 +1,25 @@
+import pulp
+import inspect
+
+print("Module:", pulp.__file__)
+print("Version:", getattr(pulp, "__version__", "unknown"))
+print("LpVariable:", inspect.signature(pulp.LpVariable))
+best_x = best_y = best_profit = None
+
+best_x = best_y = best_profit = None
+
+for x in range(5):       # x <= 4
+    for y in range(4):   # y <= 3
+        if 6 * x + 4 * y <= 24 and x + 2 * y <= 6:
+            profit = 5 * x + 4 * y
+            if best_profit is None or profit > best_profit:
+                best_x, best_y, best_profit = x, y, profit
+
+if best_profit is not None:
+    print("Status: Optimal")
+    print("Optimal Value of x =", best_x)
+    print("Optimal Value of y =", best_y)
+    print("Maximum Profit =", best_profit)
+else:
+    print("Status: Infeasible")
+    print("No feasible solution found.")
