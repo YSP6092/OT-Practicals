@@ -1,0 +1,35 @@
+import sympy as sp
+
+# Define variables
+x, lam = sp.symbols("x lam", real=True, nonnegative=True)
+
+# Objective: minimize f = x^2
+f = x**2
+
+# Constraint: x >= 2, written as g(x) = 2 - x <= 0
+g = 2 - x
+
+# Lagrangian and KKT conditions
+L = f + lam * g
+stationarity = sp.diff(L, x)
+complementary_slackness = lam * g
+
+# Solve stationarity and complementary slackness
+solutions = sp.solve(
+    (stationarity, complementary_slackness),
+    (x, lam),
+    dict=True
+)
+
+print("Possible solutions:", solutions)
+
+for sol in solutions:
+    x_val = sol[x]
+    lam_val = sol[lam]
+
+    # Check primal and dual feasibility
+    if x_val >= 2 and lam_val >= 0:
+        print("\nOptimal solution")
+        print("x =", x_val)
+        print("Lambda =", lam_val)
+        print("Minimum value =", f.subs(x, x_val))
