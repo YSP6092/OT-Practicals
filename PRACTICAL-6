@@ -1,0 +1,26 @@
+def f(x):
+    return x**2 - 4*x + 4
+
+def df(x):
+    return 2*x - 4
+
+def d2f(x):
+    return 2
+
+# Initial guess and stopping criteria
+x = 0.0
+tol = 1e-6
+max_iter = 20
+
+print("Iteration\t x")
+for i in range(max_iter):
+    x_new = x - df(x) / d2f(x)
+    print(f"{i + 1}\t\t {x_new:.6f}")
+
+    if abs(x_new - x) < tol:
+        break
+
+    x = x_new
+
+print("\nOptimal Point =", x_new)
+print("Minimum Function Value =", f(x_new))
