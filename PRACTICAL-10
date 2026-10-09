@@ -1,69 +1,449 @@
-import numpy as np
 
-def northwest_corner(cost, supply, demand):
-    cost = np.array(cost, dtype=int)
-    supply = list(supply)
-    demand = list(demand)
+import time, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from scipy.optimize import linprog
+from scipy.sparse import coo_matrix
 
-    # Step 1: Balance the problem if needed
-    total_supply, total_demand = sum(supply), sum(demand)
-    if total_supply > total_demand:
-        # Add dummy destination
-        demand.append(total_supply - total_demand)
-        cost = np.hstack((cost, np.zeros((cost.shape[0], 1), dtype=int)))
-        print(f"Added dummy destination with demand {demand[-1]}")
-    elif total_demand > total_supply:
-        # Add dummy source
-        supply.append(total_demand - total_supply)
-        cost = np.vstack((cost, np.zeros((1, cost.shape[1]), dtype=int)))
-        print(f"Added dummy source with supply {supply[-1]}")
+MODE = "fast"            # "fast" = 36 representative days (quick, for live demo)
+                         # "full" = all 365 days (exact, slow, use for final numbers)
+USE_REAL_DATA = False    # True -> read load.csv (column "kW") and cf.csv (column "cf"), 8760 rows each
+RUN_FULL_CHECK = True    # in fast mode, also solve the full year and report the gap
 
-    m, n = len(supply), len(demand)
-    remaining_supply = supply.copy()
-    remaining_demand = demand.copy()
+# ------------------ 1. PARAMETERS (EDIT FOR YOUR BUILDING) ------------------
+P = dict(
+    pv_cost=45000,        # Rs per kW of solar installed
+    bat_cost_kwh=20000,   # Rs per kWh of battery
+    bat_cost_kw=8000,     # Rs per kW of battery inverter
+    pv_life=25, bat_life=12, disc=0.10,   # lifetimes (years), discount rate
+    eta=0.95,             # one-way battery efficiency (round trip 0.90)
+    soc_min=0.10,         # minimum state of charge (fraction of capacity)
+    deg_cost=2.0,         # Rs per kWh discharged (battery wear)
+    feedin=3.0,           # Rs per kWh exported (must stay below lowest tariff)
+    demand_charge=400,    # Rs per kW per month on peak grid draw
+    roof_kw_max=200,      # max solar kW the roof can hold
+    ef=0.82,              # kg CO2 per kWh of grid electricity
+    cmax=1.0,             # max battery kW per kWh
+)
+def tariff_for_hour(h):               # time-of-day tariff, Rs/kWh
+    if h >= 22 or h < 6:  return 5.5  # off-peak
+    if 18 <= h < 22:      return 9.0  # peak
+    return 7.0                        # normal
+PERIODS = [("Off-peak (22-6h)", 5.5), ("Normal (6-18h)", 7.0), ("Peak (18-22h)", 9.0)]
 
-    allocation = np.zeros((m, n), dtype=int)
-    basic_cells = []  # tracks occupied cells (including degenerate zero ones)
+# ------------------ 2. DATA ------------------
+T_FULL = 8760
+idx = pd.date_range("2023-01-01", periods=T_FULL, freq="h")
+hour, month, doy = idx.hour.values, idx.month.values - 1, idx.dayofyear.values
+weekend = idx.dayofweek.values >= 5
+rng = np.random.default_rng(42)
 
-    # Step 2: Northwest Corner Method
-    i, j = 0, 0
-    while i < m and j < n:
-        quantity = min(remaining_supply[i], remaining_demand[j])
-        allocation[i, j] = quantity
-        basic_cells.append((i, j))
+def synth_load():
+    occ = np.where((hour >= 8) & (hour < 18), 70.0, 15.0)
+    occ = np.where(weekend, occ * 0.4, occ)
+    season = 1 + 0.35 * np.exp(-((month - 4.5) ** 2) / 4)       # summer AC peak
+    return (40.0 + occ) * season * np.clip(1 + 0.05 * rng.standard_normal(T_FULL), 0.8, None)
 
-        remaining_supply[i] -= quantity
-        remaining_demand[j] -= quantity
+def synth_cf():                                                 # kWh per kW per hour
+    decl = 23.45 * np.sin(np.radians(360 * (284 + doy) / 365))
+    lat, ha = 21.1, 15 * (hour + 0.5 - 12)
+    cosz = (np.sin(np.radians(lat)) * np.sin(np.radians(decl)) +
+            np.cos(np.radians(lat)) * np.cos(np.radians(decl)) * np.cos(np.radians(ha)))
+    daily = np.clip(rng.beta(5, 1.5, 365), 0.2, 1)              # daily cloudiness
+    monsoon = np.where((month >= 5) & (month <= 8), 0.55, 1.0)
+    return np.clip(np.clip(cosz, 0, None) * 0.80 * daily[doy - 1] * monsoon, 0, 1)
 
-        if remaining_supply[i] == 0 and remaining_demand[j] == 0:
-            # Degenerate case: move only one step so a zero-valued
-            # basic cell is kept, preserving m + n - 1 basic cells
-            if j < n - 1:
-                j += 1
-            else:
-                i += 1
-        elif remaining_supply[i] == 0:
-            i += 1
-        else:
-            j += 1
+if USE_REAL_DATA:
+    load_full = pd.read_csv("load.csv")["kW"].values.astype(float)
+    cf_full = pd.read_csv("cf.csv")["cf"].values.astype(float)
+    assert len(load_full) == T_FULL and len(cf_full) == T_FULL, "need exactly 8760 hourly rows each"
+    assert not (np.isnan(load_full).any() or np.isnan(cf_full).any()), "NaN values in data"
+    assert (load_full >= 0).all(), "negative load found"
+    assert (cf_full >= 0).all() and (cf_full <= 1).all(), "capacity factor must be between 0 and 1"
+else:
+    load_full, cf_full = synth_load(), synth_cf()
+tariff_full = np.array([tariff_for_hour(h) for h in hour])
 
-    total_cost = int(np.sum(allocation * cost))
-    return allocation, total_cost, basic_cells
+# ---- time axis: full year, or representative days with weights ----
+def build_days(mode):
+    if mode == "full":
+        return [(d, 1.0) for d in range(1, 366)]
+    out = []
+    for m in range(12):
+        ds = sorted(set(doy[month == m]))
+        e_of = lambda d: load_full[(d - 1) * 24:d * 24].sum()
+        wk = [d for d in ds if not weekend[(d - 1) * 24]]
+        we = [d for d in ds if weekend[(d - 1) * 24]]
+        peak_day = max(ds, key=e_of)                  # highest-load day (drives demand charge)
+        wk_rest = [d for d in wk if d != peak_day]
+        we_rest = [d for d in we if d != peak_day]
+        wk_med = sorted(wk_rest, key=e_of)[len(wk_rest) // 2]
+        we_med = sorted(we_rest, key=e_of)[len(we_rest) // 2]
+        out += [(peak_day, 1.0), (wk_med, float(len(wk_rest))), (we_med, float(len(we_rest)))]
+    return out
 
+SCEN = [("sunny", 1.05, 1.00, 0.3), ("normal", 1.00, 1.00, 0.5), ("cloudy", 0.75, 1.05, 0.2)]
+def scen_data(lst):
+    tot = sum(x[3] for x in lst)
+    return [dict(name=n, cf=np.clip(cf * s, 0, 1), L=load * l, w=p / tot) for n, s, l, p in lst]
 
-# Cost per unit
-cost = [
-    [2, 3, 1],
-    [5, 4, 8],
-    [5, 6, 8]
-]
+def set_axis(mode):
+    """(Re)build the time axis used by the LP. Sets module-level arrays."""
+    global DAYS, sel, tw, N, load, cf, tariff, mon, hsel, prev, NORMAL
+    DAYS = build_days(mode)
+    sel = np.concatenate([np.arange((d - 1) * 24, d * 24) for d, _ in DAYS])
+    tw = np.concatenate([np.full(24, w) for _, w in DAYS])      # hour weights (days represented)
+    N = len(sel)
+    load, cf, tariff, mon, hsel = load_full[sel], cf_full[sel], tariff_full[sel], month[sel], hour[sel]
+    prev = np.array([(i // 24) * 24 + ((i % 24) - 1) % 24 for i in range(N)])   # cyclic within each day
+    assert abs(tw.sum() - 8760) < 1e-6, "weights must add to 8760 hours"
+    NORMAL = scen_data([("normal", 1, 1, 1.0)])
+set_axis(MODE)
 
-supply = [30, 40, 20]
-demand = [20, 30, 40]
+# ------------------ 3. FINANCE HELPERS ------------------
+def crf(r, n): return r * (1 + r) ** n / ((1 + r) ** n - 1)
+def upfront(pv, eb, pb): return P["pv_cost"] * pv + P["bat_cost_kwh"] * eb + P["bat_cost_kw"] * pb
+def npv(z, sav):
+    """25-year NPV: -capex + discounted savings - discounted battery replacements (yr 12, 24)."""
+    cap = upfront(z["pv"], z["ebat"], z["pbat"])
+    ann = sum(1 / (1 + P["disc"]) ** y for y in range(1, P["pv_life"] + 1))
+    bat_cap = P["bat_cost_kwh"] * z["ebat"] + P["bat_cost_kw"] * z["pbat"]
+    repl = sum(bat_cap / (1 + P["disc"]) ** y for y in range(P["bat_life"], P["pv_life"], P["bat_life"]))
+    return -cap + sav * ann - repl
 
-allocation, total_cost, basic_cells = northwest_corner(cost, supply, demand)
+# ------------------ 4. THE LP ------------------
+def solve(scens, fix=None, eps=None, objective="cost"):
+    """fix=(pv,ebat,pbat), None entries stay free. eps = max annual CO2 (kg)."""
+    K, blk = len(scens), 12 + 5 * N
+    n = 3 + K * blk
+    PV, EB, PB = 0, 1, 2
+    o  = lambda k: 3 + k * blk
+    pk = lambda k, m: o(k) + m
+    g  = lambda k, t: o(k) + 12 + t
+    c  = lambda k, t: o(k) + 12 + N + t
+    d  = lambda k, t: o(k) + 12 + 2 * N + t
+    e  = lambda k, t: o(k) + 12 + 3 * N + t
+    s  = lambda k, t: o(k) + 12 + 4 * N + t
+    cost = np.zeros(n); emis = np.zeros(n)
+    cost[PV] = P["pv_cost"] * crf(P["disc"], P["pv_life"])
+    cost[EB] = P["bat_cost_kwh"] * crf(P["disc"], P["bat_life"])
+    cost[PB] = P["bat_cost_kw"] * crf(P["disc"], P["bat_life"])
+    for k, sc in enumerate(scens):
+        for m in range(12): cost[pk(k, m)] = sc["w"] * P["demand_charge"]
+        for t in range(N):
+            cost[g(k, t)] = sc["w"] * tw[t] * tariff[t]
+            cost[e(k, t)] = -sc["w"] * tw[t] * P["feedin"]
+            cost[d(k, t)] = sc["w"] * tw[t] * P["deg_cost"]
+            emis[g(k, t)] = sc["w"] * tw[t] * P["ef"]
+    obj = cost if objective == "cost" else emis
 
-print("Allocation Matrix:")
-print(allocation)
-print("\nBasic cells:", basic_cells)
-print("Total Transportation Cost =", total_cost)
+    r, cc, v, beq, row = [], [], [], [], 0
+    for k, sc in enumerate(scens):
+        for t in range(N):                       # energy balance
+            r += [row] * 5; cc += [PV, g(k, t), d(k, t), c(k, t), e(k, t)]
+            v += [sc["cf"][t], 1, 1, -1, -1]; beq.append(sc["L"][t]); row += 1
+        for t in range(N):                       # battery dynamics
+            r += [row] * 4; cc += [s(k, t), s(k, prev[t]), c(k, t), d(k, t)]
+            v += [1, -1, -P["eta"], 1 / P["eta"]]; beq.append(0); row += 1
+    Aeq = coo_matrix((v, (r, cc)), shape=(row, n)).tocsr()
+
+    r, cc, v, b, row = [], [], [], [], 0
+    def add(terms, rhs):
+        nonlocal row
+        for j, a in terms: r.append(row); cc.append(j); v.append(a)
+        b.append(rhs); row += 1
+    add([(PB, 1), (EB, -P["cmax"])], 0)
+    for k, sc in enumerate(scens):
+        for t in range(N):
+            add([(s(k, t), 1), (EB, -1)], 0)                  # SOC <= capacity
+            add([(EB, P["soc_min"]), (s(k, t), -1)], 0)       # SOC >= min
+            add([(c(k, t), 1), (PB, -1)], 0)
+            add([(d(k, t), 1), (PB, -1)], 0)
+            add([(g(k, t), 1), (pk(k, mon[t]), -1)], 0)       # peak definition
+            add([(e(k, t), 1), (PV, -sc["cf"][t])], 0)        # export <= solar output
+    if eps is not None:
+        add([(j, emis[j]) for j in np.nonzero(emis)[0]], eps)
+    Aub = coo_matrix((v, (r, cc)), shape=(row, n)).tocsr()
+
+    lo, hi = np.zeros(n), np.full(n, np.inf); hi[PV] = P["roof_kw_max"]
+    if fix is not None:
+        for j, val in zip((PV, EB, PB), fix):
+            if val is not None: lo[j] = hi[j] = val
+    res = linprog(obj, A_ub=Aub, b_ub=b, A_eq=Aeq, b_eq=beq,
+                  bounds=list(zip(lo, hi)), method="highs")
+    if res.status != 0:
+        raise RuntimeError(f"LP failed (status {res.status}): {res.message}")
+    x = np.maximum(res.x, 0.0) + 0.0            # clip tiny negatives, kills -0.0
+    out = dict(pv=x[PV], ebat=x[EB], pbat=x[PB], total=float(cost @ x),
+               co2=float(emis @ x), scen=[])
+    for k in range(K):
+        sl_ = lambda f: x[f(k, 0):f(k, 0) + N]
+        gk, ek, dk = sl_(g), sl_(e), sl_(d)
+        pks = x[pk(k, 0):pk(k, 0) + 12]
+        opex = (tw * tariff) @ gk + P["demand_charge"] * pks.sum() \
+               - P["feedin"] * (tw @ ek) + P["deg_cost"] * (tw @ dk)
+        out["scen"].append(dict(g=gk, c=sl_(c), d=dk, e=ek, s=sl_(s), peak=pks, opex=float(opex)))
+    out["opex"] = sum(sc["w"] * z["opex"] for sc, z in zip(scens, out["scen"]))
+    return out
+
+# ------------------ 5. RUN ------------------
+T0 = time.time()
+print(f"MODE={MODE}: {len(DAYS)} days, {N} hourly steps\n")
+base = solve(NORMAL, fix=(0, 0, 0))
+pv_only = solve(NORMAL, fix=(None, 0, 0))
+opt = solve(NORMAL)
+print(f"[{time.time()-T0:.0f}s] core LPs solved")
+
+def report(name, z):
+    cap = upfront(z["pv"], z["ebat"], z["pbat"])
+    sav = base["opex"] - z["opex"]
+    return {"Case": name, "PV (kW)": round(z["pv"], 1) + 0.0, "Battery (kWh)": round(z["ebat"], 1) + 0.0,
+            "Battery (kW)": round(z["pbat"], 1) + 0.0, "Capex (Rs lakh)": round(cap / 1e5, 2),
+            "Annual bill (Rs lakh)": round(z["opex"] / 1e5, 2), "Savings (Rs lakh/yr)": round(sav / 1e5, 2),
+            "Payback (yrs)": round(cap / sav, 1) if sav > 1e-6 else float("inf"),
+            "NPV 25y (Rs lakh)": round(npv(z, sav) / 1e5, 2),
+            "CO2 (tonnes/yr)": round(z["co2"] / 1000, 1)}
+table = pd.DataFrame([report("Grid only (today)", base), report("Solar only", pv_only),
+                      report("Solar + Battery (optimal)", opt)])
+pd.set_option("display.width", 250); pd.set_option("display.max_columns", 30)
+print("\n=== 1. MAIN RESULTS ===")
+print(table.T.to_string(header=False))
+table.to_csv("main_results.csv", index=False)
+
+# battery add-on economics (on top of solar)
+d_cap = upfront(opt["pv"], opt["ebat"], opt["pbat"]) - upfront(pv_only["pv"], 0, 0)
+d_sav = pv_only["opex"] - opt["opex"]
+bat_cap = P["bat_cost_kwh"] * opt["ebat"] + P["bat_cost_kw"] * opt["pbat"]
+ann = sum(1 / (1 + P["disc"]) ** y for y in range(1, P["pv_life"] + 1))
+repl = sum(bat_cap / (1 + P["disc"]) ** y for y in range(P["bat_life"], P["pv_life"], P["bat_life"]))
+d_npv = -d_cap + d_sav * ann - repl
+print(f"\nBattery add-on (on top of solar): extra capex Rs {d_cap/1e5:.2f} lakh, extra saving Rs {d_sav/1e5:.3f} lakh/yr, "
+      f"incremental payback {d_cap/d_sav if d_sav > 1e-6 else float('inf'):.1f} yrs, incremental NPV Rs {d_npv/1e5:.2f} lakh")
+if opt["pv"] >= P["roof_kw_max"] - 1e-6:
+    print(f"NOTE: solar size is capped by the roof limit ({P['roof_kw_max']} kW), not by economics. See roof sensitivity below.")
+
+# stochastic
+S = scen_data(SCEN)
+stoch = solve(S)
+eev = solve(S, fix=(opt["pv"], opt["ebat"], opt["pbat"]))
+vss = eev["total"] - stoch["total"]
+print(f"\n=== 2. STOCHASTIC PLANNING (sunny 30% / normal 50% / cloudy 20%) ===")
+print(f"Deterministic sizes: PV {opt['pv']:.1f} kW, battery {opt['ebat']:.1f} kWh")
+print(f"Stochastic sizes   : PV {stoch['pv']:.1f} kW, battery {stoch['ebat']:.1f} kWh")
+print(f"Expected annual cost, deterministic plan: Rs {eev['total']:,.0f}")
+print(f"Expected annual cost, stochastic plan   : Rs {stoch['total']:,.0f}")
+print(f"Value of Stochastic Solution (VSS)      : Rs {vss:,.0f} per year")
+if vss < 0.001 * stoch["total"]:
+    print("-> VSS is about zero: the normal-year design is already robust to weather.")
+print(f"[{time.time()-T0:.0f}s]")
+
+# Pareto: start at the cost-optimal CO2 level, tighten down to the minimum possible
+em_min = solve(NORMAL, objective="co2")
+rows = []
+for eps in np.linspace(opt["co2"], em_min["co2"] * 1.001, 6):
+    z = solve(NORMAL, eps=eps)
+    rows.append((z["co2"] / 1000, z["total"] / 1e5, z["pv"], z["ebat"]))
+pareto = pd.DataFrame(rows, columns=["CO2 (t/yr)", "Cost (Rs lakh/yr)", "PV (kW)", "Battery (kWh)"])
+print("\n=== 3. PARETO FRONT: COST vs CO2 ===\n" + pareto.round(2).to_string(index=False))
+dco2 = pareto["CO2 (t/yr)"].iloc[-2] - pareto["CO2 (t/yr)"].iloc[-1]
+if dco2 > 1e-9:
+    mc = (pareto["Cost (Rs lakh/yr)"].iloc[-1] - pareto["Cost (Rs lakh/yr)"].iloc[-2]) * 1e5 / dco2
+    print(f"Marginal cost of cutting CO2 at the far end: about Rs {mc/1e5:.2f} lakh per tonne")
+print(f"[{time.time()-T0:.0f}s]")
+
+# sensitivity: battery price
+rows, orig = [], P["bat_cost_kwh"]
+for bc in [8000, 14000, 20000, 30000]:
+    P["bat_cost_kwh"] = bc; z = solve(NORMAL)
+    rows.append((bc, z["ebat"], z["pbat"], z["pv"], z["total"] / 1e5))
+P["bat_cost_kwh"] = orig
+sens = pd.DataFrame(rows, columns=["Battery Rs/kWh", "Opt battery (kWh)", "Opt battery (kW)", "Opt PV (kW)", "Cost (Rs lakh/yr)"])
+print("\n=== 4. SENSITIVITY TO BATTERY PRICE ===\n" + sens.round(2).to_string(index=False))
+
+# sensitivity: roof size
+rows, orig = [], P["roof_kw_max"]
+for rk in [100, 200, 300, 500, 800]:
+    P["roof_kw_max"] = rk; z = solve(NORMAL)
+    rows.append((rk, z["pv"], z["ebat"], z["total"] / 1e5))
+P["roof_kw_max"] = orig
+roof = pd.DataFrame(rows, columns=["Roof limit (kW)", "Opt PV (kW)", "Opt battery (kWh)", "Cost (Rs lakh/yr)"])
+print("\n=== 5. SENSITIVITY TO ROOF SIZE ===\n" + roof.round(2).to_string(index=False))
+print(f"[{time.time()-T0:.0f}s]")
+
+# fast-vs-full accuracy check
+if MODE == "fast" and RUN_FULL_CHECK:
+    set_axis("full")
+    opt_full = solve(NORMAL)
+    set_axis("fast")
+    gap = abs(opt["opex"] - opt_full["opex"]) / opt_full["opex"] * 100
+    print(f"\n=== 6. FAST vs FULL-YEAR CHECK ===")
+    print(f"Bill: fast Rs {opt['opex']/1e5:.2f} lakh vs full Rs {opt_full['opex']/1e5:.2f} lakh (gap {gap:.2f}%)")
+    print(f"Battery: fast {opt['ebat']:.1f} kWh vs full {opt_full['ebat']:.1f} kWh | "
+          f"PV: fast {opt['pv']:.1f} kW vs full {opt_full['pv']:.1f} kW")
+    print(f"[{time.time()-T0:.0f}s]")
+
+# ------------------ 7. VALIDATION CHECKS ------------------
+def validate(z, scens, label, tol=1e-3):
+    for k, sc in enumerate(scens):
+        zz = z["scen"][k]
+        bal = z["pv"] * sc["cf"] + zz["g"] + zz["d"] - sc["L"] - zz["c"] - zz["e"]
+        assert np.abs(bal).max() < tol, f"{label}: energy balance violated"
+        dyn = zz["s"] - zz["s"][prev] - P["eta"] * zz["c"] + zz["d"] / P["eta"]
+        assert np.abs(dyn).max() < tol, f"{label}: battery dynamics violated"
+        assert zz["s"].max() <= z["ebat"] + tol and zz["s"].min() >= P["soc_min"] * z["ebat"] - tol, f"{label}: SOC limits"
+        assert zz["c"].max() <= z["pbat"] + tol and zz["d"].max() <= z["pbat"] + tol, f"{label}: power limit"
+        assert z["pbat"] <= P["cmax"] * z["ebat"] + tol, f"{label}: C-rate"
+        assert (zz["e"] <= z["pv"] * sc["cf"] + tol).all(), f"{label}: export limit"
+        assert z["pv"] <= P["roof_kw_max"] + tol, f"{label}: roof limit"
+        for m in range(12):
+            gm = zz["g"][mon == m].max()
+            assert abs(zz["peak"][m] - gm) < 1e-2, f"{label}: monthly peak mismatch"
+    co2 = sum(sc["w"] * (tw @ z["scen"][k]["g"]) * P["ef"] for k, sc in enumerate(scens))
+    assert abs(co2 - z["co2"]) < 1e-3 * max(1, z["co2"]), f"{label}: CO2 bookkeeping"
+
+for name, z, sc_ in [("base", base, NORMAL), ("pv_only", pv_only, NORMAL), ("opt", opt, NORMAL), ("stoch", stoch, S)]:
+    validate(z, sc_, name)
+z0 = opt["scen"][0]
+chk = (tw * tariff) @ load + P["demand_charge"] * sum(load[mon == m].max() for m in range(12))
+assert abs(chk - base["opex"]) / base["opex"] < 1e-6, "baseline bill mismatch"
+assert (pv_only["total"] <= base["total"] + 1) and (opt["total"] <= pv_only["total"] + 1), "ordering violated"
+assert stoch["total"] <= eev["total"] + 1, "stochastic must be no worse"
+assert (np.diff(pareto["CO2 (t/yr)"]) <= 1e-6).all() and (np.diff(pareto["Cost (Rs lakh/yr)"]) >= -1e-6).all(), "Pareto not monotone"
+both = int(((z0["c"] > 1e-3) & (z0["d"] > 1e-3)).sum())
+print("\n=== VALIDATION: all checks passed ===")
+print(f"Energy balance, battery dynamics, SOC and power limits, export limit, roof limit, monthly peak, CO2 bookkeeping, "
+      f"baseline bill, cost ordering, Pareto monotonicity all OK | hours charging+discharging together: {both}")
+
+# ------------------ 8. BILL BEFORE vs AFTER (THE DEMO) ------------------
+def bill_parts(z):
+    zz = z["scen"][0]
+    return dict(energy=float((tw * tariff) @ zz["g"]),
+                demand=float(P["demand_charge"] * zz["peak"].sum()),
+                export=float(P["feedin"] * (tw @ zz["e"])),      # income, subtracted from bill
+                wear=float(P["deg_cost"] * (tw @ zz["d"])),
+                kwh_bought=float(tw @ zz["g"]))
+def monthly_bill(z):
+    zz = z["scen"][0]
+    return np.array([((tw * tariff * zz["g"])[mon == m].sum() + P["demand_charge"] * zz["peak"][m]
+                      - P["feedin"] * (tw * zz["e"])[mon == m].sum() + P["deg_cost"] * (tw * zz["d"])[mon == m].sum())
+                     for m in range(12)])
+def bought_by_period(z):
+    zz = z["scen"][0]
+    return [float((tw * zz["g"])[tariff == tr].sum()) for _, tr in PERIODS]
+
+bb, bs, bo = bill_parts(base), bill_parts(pv_only), bill_parts(opt)
+bill = lambda p: p["energy"] + p["demand"] - p["export"] + p["wear"]
+lakh = lambda x: x / 1e5
+
+print("\n" + "=" * 70)
+print("  BILL BEFORE vs AFTER  (Rs lakh per year)")
+print("=" * 70)
+demo = pd.DataFrame({
+    "Before (grid only)": [bb["energy"], bb["demand"], -bb["export"] + 0.0, bb["wear"], bill(bb)],
+    "After (solar only)": [bs["energy"], bs["demand"], -bs["export"], bs["wear"], bill(bs)],
+    "After (solar+battery)": [bo["energy"], bo["demand"], -bo["export"], bo["wear"], bill(bo)],
+}, index=["Energy charges (kWh x tariff)", "Demand charge (peak kW)", "Export income (credit)", "Battery wear cost", "TOTAL ELECTRICITY BILL"])
+demo["Saved (Before - After)"] = demo["Before (grid only)"] - demo["After (solar+battery)"]
+print((demo / 1e5).round(2).to_string())
+pct = (bill(bb) - bill(bo)) / bill(bb) * 100
+print(f"\nBill falls from Rs {lakh(bill(bb)):.2f} lakh to Rs {lakh(bill(bo)):.2f} lakh per year "
+      f"(saving Rs {lakh(bill(bb)-bill(bo)):.2f} lakh = {pct:.0f}%).")
+print(f"Equipment cost, spread over its life: Rs {lakh(opt['total']-opt['opex']):.2f} lakh/yr "
+      f"-> true yearly cost (bill + equipment) Rs {lakh(opt['total']):.2f} lakh vs Rs {lakh(base['total']):.2f} lakh today.")
+
+print("\n--- WHERE THE SAVINGS CAME FROM ---")
+sav_energy = bb["energy"] - bo["energy"]; sav_demand = bb["demand"] - bo["demand"]
+sav_export = bo["export"] - bb["export"]; sav_wear = -(bo["wear"] - bb["wear"])
+tot_sav = bill(bb) - bill(bo)
+for nm, v in [("Buying less energy from the grid (solar + battery)", sav_energy),
+              ("Lower peak demand charge (battery shaves peaks)", sav_demand),
+              ("Selling surplus solar", sav_export),
+              ("Battery wear cost (a small cost)", sav_wear)]:
+    print(f"  {nm:<52s} Rs {lakh(v):6.2f} lakh  ({v/tot_sav*100:5.1f}% of savings)")
+print(f"  Of the total saving: solar alone gives Rs {lakh(bill(bb)-bill(bs)):.2f} lakh, "
+      f"adding the battery gives a further Rs {lakh(bill(bs)-bill(bo)):.3f} lakh.")
+
+print("\n--- GRID ENERGY BOUGHT BY TIME OF DAY (MWh per year) ---")
+kb, ko = bought_by_period(base), bought_by_period(opt)
+for (nm, _), a, b_ in zip(PERIODS, kb, ko):
+    print(f"  {nm:<18s} before {a/1000:8.1f}  after {b_/1000:8.1f}  (cut {100*(a-b_)/a if a else 0:4.0f}%)")
+print(f"  Total grid energy: {bb['kwh_bought']/1000:.1f} -> {bo['kwh_bought']/1000:.1f} MWh/yr | "
+      f"CO2 {base['co2']/1000:.0f} -> {opt['co2']/1000:.0f} tonnes/yr")
+print(f"  Peak demand (highest month): {base['scen'][0]['peak'].max():.0f} kW -> {opt['scen'][0]['peak'].max():.0f} kW")
+
+# ------------------ 9. HEADLINE ------------------
+r3 = table.iloc[2]
+print(f"\nHEADLINE: Optimal {r3['PV (kW)']} kW solar + {r3['Battery (kWh)']} kWh battery cuts the annual "
+      f"electricity bill from Rs {base['opex']/1e5:.2f} to Rs {opt['opex']/1e5:.2f} lakh "
+      f"(saving Rs {r3['Savings (Rs lakh/yr)']} lakh/yr), payback {r3['Payback (yrs)']} years, "
+      f"avoiding {(base['co2']-opt['co2'])/1000:.0f} tonnes CO2/yr.")
+print(f"Total runtime: {time.time()-T0:.0f}s")
+
+# ------------------ 10. PLOTS ------------------
+# ---- Figure 1: the BILL DEMO ----
+fig1, bx = plt.subplots(1, 3, figsize=(19, 5.5))
+labels = ["Before\n(grid only)", "Solar only", "Solar +\nBattery"]
+parts = [bb, bs, bo]
+bottom = np.zeros(3)
+for key, col, nm in [("energy", "#d62728", "Energy charges"), ("demand", "#ff7f0e", "Demand charge"), ("wear", "#7f7f7f", "Battery wear")]:
+    vals = np.array([p[key] for p in parts]) / 1e5
+    bx[0].bar(labels, vals, bottom=bottom, color=col, label=nm); bottom += vals
+exp_ = np.array([p["export"] for p in parts]) / 1e5
+bx[0].bar(labels, -exp_, color="#2ca02c", label="Export income")
+for i, p in enumerate(parts):
+    bx[0].text(i, bottom[i] + 0.5, f"Rs {bill(p)/1e5:.1f}L", ha="center", fontweight="bold")
+bx[0].axhline(0, color="k", lw=0.8); bx[0].set_ylim(top=bottom.max() * 1.12)
+bx[0].set_title("Annual electricity bill: before vs after"); bx[0].set_ylabel("Rs lakh / year"); bx[0].legend(loc="lower left")
+# waterfall
+steps = [("Bill before", bill(bb)), ("Less grid\nenergy", -sav_energy), ("Lower peak\ndemand", -sav_demand),
+         ("Export\nincome", -sav_export), ("Battery\nwear", -sav_wear), ("Bill after", bill(bo))]
+run = 0.0
+for i, (nm, v) in enumerate(steps):
+    if i in (0, len(steps) - 1):
+        bx[1].bar(i, v / 1e5, color="gray" if i == 0 else "green"); run = v if i == 0 else run
+        bx[1].text(i, v / 1e5 + 0.5, f"{v/1e5:.1f}", ha="center")
+    else:
+        lo_, hi_ = min(run, run + v), max(run, run + v)
+        bx[1].bar(i, (hi_ - lo_) / 1e5, bottom=lo_ / 1e5, color="#2ca02c" if v < 0 else "#d62728")
+        bx[1].text(i, hi_ / 1e5 + 0.5, f"{v/1e5:+.2f}", ha="center"); run += v
+bx[1].set_xticks(range(len(steps))); bx[1].set_xticklabels([s_[0] for s_ in steps], fontsize=9)
+bx[1].set_title("Where the savings came from"); bx[1].set_ylabel("Rs lakh / year")
+mb, mo = monthly_bill(base) / 1e5, monthly_bill(opt) / 1e5
+mlab = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+xm = np.arange(12)
+bx[2].bar(xm - 0.2, mb, 0.4, color="gray", label="Before"); bx[2].bar(xm + 0.2, mo, 0.4, color="green", label="After")
+bx[2].set_xticks(xm); bx[2].set_xticklabels(mlab, fontsize=8)
+bx[2].set_title("Monthly bill: before vs after"); bx[2].set_ylabel("Rs lakh / month"); bx[2].legend()
+plt.tight_layout(); fig1.savefig("bill_before_after.png", dpi=150); plt.show()
+
+# ---- Figure 2: technical plots ----
+fig, ax = plt.subplots(2, 4, figsize=(22, 9))
+nd = len(DAYS)
+months_sel = month[sel]
+cand = [i for i in range(nd) if months_sel[i * 24] in (3, 4, 5) and DAYS[i][1] > 1] or \
+       [i for i in range(nd) if months_sel[i * 24] in (3, 4, 5)] or [0]
+dsel = cand[0]
+sl = slice(dsel * 24, dsel * 24 + 24)
+ax[0, 0].plot(load[sl], label="Load"); ax[0, 0].plot(opt["pv"] * cf[sl], label="Solar")
+ax[0, 0].plot(z0["g"][sl], label="Grid import"); ax[0, 0].plot(z0["s"][sl], "--", label="Battery SOC (kWh)")
+ax[0, 0].set_title("Optimal dispatch on a typical summer day"); ax[0, 0].set_xlabel("hour"); ax[0, 0].set_ylabel("kW / kWh"); ax[0, 0].legend()
+hm = (z0["d"] - z0["c"]).reshape(nd, 24).T
+im = ax[0, 1].imshow(hm, aspect="auto", cmap="RdBu_r", origin="lower")
+ax[0, 1].set_title("Battery discharge(+)/charge(-) kW"); ax[0, 1].set_xlabel("representative day"); ax[0, 1].set_ylabel("hour")
+plt.colorbar(im, ax=ax[0, 1])
+ax[0, 2].bar(["Grid only", "Solar only", "Solar+Battery"],
+             [base["total"] / 1e5, pv_only["total"] / 1e5, opt["total"] / 1e5], color=["gray", "orange", "green"])
+ax[0, 2].set_title("Annualized total cost (capex + bill)"); ax[0, 2].set_ylabel("Rs lakh")
+ax[0, 3].plot(roof["Roof limit (kW)"], roof["Opt PV (kW)"], "o-", color="teal", label="Optimal PV")
+ax[0, 3].plot(roof["Roof limit (kW)"], roof["Roof limit (kW)"], "k:", label="Roof limit")
+ax[0, 3].set_title("Roof sensitivity: optimal solar size"); ax[0, 3].set_xlabel("roof limit (kW)"); ax[0, 3].set_ylabel("kW"); ax[0, 3].legend()
+ax[1, 0].plot(pareto["CO2 (t/yr)"], pareto["Cost (Rs lakh/yr)"], "o-")
+ax[1, 0].set_title("Pareto front: cost vs CO2"); ax[1, 0].set_xlabel("CO2 (tonnes/yr)"); ax[1, 0].set_ylabel("Rs lakh/yr")
+ax[1, 1].plot(sens["Battery Rs/kWh"], sens["Opt battery (kWh)"], "o-", color="purple")
+ax[1, 1].set_title("Optimal battery size vs battery price"); ax[1, 1].set_xlabel("Rs per kWh"); ax[1, 1].set_ylabel("kWh")
+xm = np.arange(12)
+ax[1, 2].bar(xm, base["scen"][0]["peak"], alpha=.5, label="Grid only")
+ax[1, 2].bar(xm, z0["peak"], alpha=.8, label="Optimal")
+ax[1, 2].set_xticks(xm); ax[1, 2].set_xticklabels(mlab, fontsize=8)     # distinct month names (J/M/A repeats merged bars)
+ax[1, 2].set_title("Monthly peak grid demand (kW)"); ax[1, 2].legend()
+ax[1, 3].axis("off")
+plt.tight_layout(); fig.savefig("optimizer_results.png", dpi=150); plt.show()
+print("Saved: bill_before_after.png, optimizer_results.png, main_results.csv")
